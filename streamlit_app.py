@@ -130,37 +130,6 @@ def get_stock_data(ticker: str) -> pd.DataFrame:
 
     return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]]
 
-@st.cache_data(ttl=REFRESH_INTERVAL_MINUTES * 60, show_spinner=False)
-def get_crypto_data(coin_id: str) -> pd.DataFrame:
-    """Fetch daily prices for a crypto via CoinGecko with resilient handling."""
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": YEARS_HISTORY * 365, "interval": "daily"}
-
-    try:
-        data = fetch_json(url, params=params, retries=4, timeout=12, backoff=1.7)
-    except Exception as e:
-        st.warning(f"⚠️ CoinGecko request failed for {coin_id}: {e}")
-        return pd.DataFrame(columns=["Date", "Price"])
-
-    if not isinstance(data, dict) or "prices" not in data or not isinstance(data["prices"], list):
-        st.warning(f"⚠️ No valid price data returned for {coin_id}.")
-        return pd.DataFrame(columns=["Date", "Price"])
-
-    prices = pd.DataFrame(data["prices"], columns=["Date", "Price"])
-    prices["Date"] = pd.to_datetime(prices["Date"], unit="ms", errors="coerce")
-    prices.dropna(subset=["Date"], inplace=True)
-    return prices[["Date", "Price"]]
-
-def quarterly_comparison_stocks(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute YoY change by quarter for stock Close prices."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Quarter", "Close", "YoY_Change_%"])
-    temp = df.copy()
-    temp["Quarter"] = temp["Date"].dt.to_period("Q")
-    grouped = temp.groupby("Quarter", as_index=False)["Close"].mean()
-    grouped["YoY_Change_%"] = grouped["Close"].pct_change(periods=4) * 100.0
-    return grouped
-
 # -----------------------------
 # Fetch Everything (parallel + safe)
 # -----------------------------
