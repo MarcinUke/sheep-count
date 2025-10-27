@@ -1,32 +1,400 @@
+# =====================================================
+# Stock & Crypto Tracker + AI Analysis Dashboard
+# Optimized for Streamlit Cloud
+# =====================================================
 
-Controls
+from __future__ import annotations
+import os
+import time
+import math
+import json
+import concurrent.futures
+from datetime import datetime, timedelta
 
-Data auto-refreshes every 5 minutes
+import pandas as pd
+import requests
+import yfinance as yf
+import plotly.graph_objs as go
+import streamlit as st
 
-📈 Stock & Crypto Performance Dashboard (AI-Powered)
-KeyError: This app has encountered an error. The original error message is redacted to prevent data leaks. Full error details have been recorded in the logs (if you're on Streamlit Cloud, click on 'Manage app' in the lower right of your app).
-Traceback:
-File "/mount/src/sheep-count/streamlit_app.py", line 145, in <module>
-    stock_data, crypto_data = fetch_all_data()
-                              ~~~~~~~~~~~~~~^^
-File "/mount/src/sheep-count/streamlit_app.py", line 111, in fetch_all_data
-    crypto_data[c] = f.result()
-                     ~~~~~~~~^^
-File "/usr/local/lib/python3.13/concurrent/futures/_base.py", line 449, in result
-    return self.__get_result()
-           ~~~~~~~~~~~~~~~~~^^
-File "/usr/local/lib/python3.13/concurrent/futures/_base.py", line 401, in __get_result
-    raise self._exception
-File "/usr/local/lib/python3.13/concurrent/futures/thread.py", line 59, in run
-    result = self.fn(*self.args, **self.kwargs)
-File "/home/adminuser/venv/lib/python3.13/site-packages/streamlit/runtime/caching/cache_utils.py", line 227, in __call__
-    return self._get_or_create_cached_value(args, kwargs, spinner_message)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-File "/home/adminuser/venv/lib/python3.13/site-packages/streamlit/runtime/caching/cache_utils.py", line 269, in _get_or_create_cached_value
-    return self._handle_cache_miss(cache, value_key, func_args, func_kwargs)
-           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-File "/home/adminuser/venv/lib/python3.13/site-packages/streamlit/runtime/caching/cache_utils.py", line 328, in _handle_cache_miss
-    computed_value = self._info.func(*func_args, **func_kwargs)
-File "/mount/src/sheep-count/streamlit_app.py", line 86, in get_crypto_data
+# -----------------------------
+# Streamlit Page Config
+# -----------------------------
+st.set_page_config(page_title="Stock & Crypto AI Tracker", layout="wide")
+
+# -----------------------------
+# App Header / Controls
+# -----------------------------
+st.title("📈 Stock & Crypto Performance Dashboard (AI-Powered)")
+st.sidebar.header("Controls")
+
+# Default configuration (you can edit these)
+YEARS_HISTORY = 5
+REFRESH_INTERVAL_MINUTES = 5
+# User tickers (you asked for these)
+USER_STOCKS = ["IONQ", "ENVX", "AMD", "RR"]  # We'll map RR -> RR.L below
+USER_CRYPTOS = ["ADA", "XRP"]
+
+# Map user-friendly tickers to data-source tickers where needed
+# Rolls-Royce on LSE is "RR.L" in Yahoo Finance
+YF_TICKER_MAP = {"RR": "RR.L"}  # if not present, use ticker as-is
+
+# CoinGecko IDs
+COINGECKO_IDS = {"ADA": "cardano", "XRP": "ripple"}
+
+# -----------------------------
+# OpenAI setup (supports both old and new SDKs)
+# -----------------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+client = None
+using_new_openai = False
+if OPENAI_API_KEY:
+    try:
+        # New SDK style
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        using_new_openai = True
+    except Exception:
+        try:
+            # Legacy SDK style
+            import openai  # type: ignore
+            openai.api_key = OPENAI_API_KEY
+            client = openai
+            using_new_openai = False
+        except Exception:
+            client = None
+
+# -----------------------------
+# Helper: resilient HTTP GET with retries/backoff
+# -----------------------------
+def fetch_json(url: str, params: dict | None = None, retries: int = 3, timeout: int = 12, backoff: float = 1.6):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            # brief exponential backoff
+            time.sleep((backoff ** attempt) + (0.2 * attempt))
+    raise last_err if last_err else RuntimeError("Unknown HTTP error")
+
+# -----------------------------
+# Data Functions (cached)
+# -----------------------------
+@st.cache_data(ttl=REFRESH_INTERVAL_MINUTES * 60, show_spinner=False)
+def get_stock_data(ticker: str) -> pd.DataFrame:
+    """Fetch daily OHLCV for a stock via yfinance, limited to YEARS_HISTORY."""
+    yf_symbol = YF_TICKER_MAP.get(ticker, ticker)
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=YEARS_HISTORY * 365)
+
+    df = yf.download(yf_symbol, start=start_date, end=end_date, interval="1d", progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"])
+
+    df = df.reset_index().rename(columns={"Date": "Date"})
+    # Ensure correct dtypes
+    if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df.dropna(subset=["Date"], inplace=True)
+    return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+
+@st.cache_data(ttl=REFRESH_INTERVAL_MINUTES * 60, show_spinner=False)
+def get_crypto_data(coin_id: str) -> pd.DataFrame:
+    """Fetch daily prices for a crypto via CoinGecko with resilient handling."""
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": YEARS_HISTORY * 365, "interval": "daily"}
+
+    try:
+        data = fetch_json(url, params=params, retries=4, timeout=12, backoff=1.7)
+    except Exception as e:
+        st.warning(f"⚠️ CoinGecko request failed for {coin_id}: {e}")
+        return pd.DataFrame(columns=["Date", "Price"])
+
+    if not isinstance(data, dict) or "prices" not in data or not isinstance(data["prices"], list):
+        st.warning(f"⚠️ No valid price data returned for {coin_id}.")
+        return pd.DataFrame(columns=["Date", "Price"])
+
     prices = pd.DataFrame(data["prices"], columns=["Date", "Price"])
-                          ~~~~^^^^^^^^^^
+    prices["Date"] = pd.to_datetime(prices["Date"], unit="ms", errors="coerce")
+    prices.dropna(subset=["Date"], inplace=True)
+    return prices[["Date", "Price"]]
+
+def quarterly_comparison_stocks(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute YoY change by quarter for stock Close prices."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Quarter", "Close", "YoY_Change_%"])
+    temp = df.copy()
+    temp["Quarter"] = temp["Date"].dt.to_period("Q")
+    grouped = temp.groupby("Quarter", as_index=False)["Close"].mean()
+    grouped["YoY_Change_%"] = grouped["Close"].pct_change(periods=4) * 100.0
+    return grouped
+
+# -----------------------------
+# Fetch Everything (parallel + safe)
+# -----------------------------
+def fetch_all_data(stocks: list[str], cryptos: list[str]):
+    stock_data, crypto_data = {}, {}
+
+    max_workers = min(8, len(stocks) + len(cryptos)) or 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        stock_futures = {executor.submit(get_stock_data, s): s for s in stocks}
+        crypto_futures = {executor.submit(get_crypto_data, COINGECKO_IDS[c]): c for c in cryptos}
+
+        # Stocks
+        for f in concurrent.futures.as_completed(stock_futures):
+            sym = stock_futures[f]
+            try:
+                stock_data[sym] = f.result()
+            except Exception as e:
+                st.error(f"Stock fetch error for {sym}: {e}")
+                stock_data[sym] = pd.DataFrame()
+
+        # Cryptos
+        for f in concurrent.futures.as_completed(crypto_futures):
+            sym = crypto_futures[f]
+            try:
+                crypto_data[sym] = f.result()
+            except Exception as e:
+                st.error(f"Crypto fetch error for {sym}: {e}")
+                crypto_data[sym] = pd.DataFrame()
+
+    return stock_data, crypto_data
+
+# -----------------------------
+# Plotting Utilities
+# -----------------------------
+def plot_line(df: pd.DataFrame, title: str, y_col: str, y_label: str = "Price"):
+    if df is None or df.empty or y_col not in df.columns:
+        st.info(f"No data to plot for {title}.")
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["Date"], y=df[y_col], mode="lines", name=title))
+    fig.update_layout(title=title, height=380, xaxis_title="Date", yaxis_title=y_label)
+    st.plotly_chart(fig, use_container_width=True)
+
+def plot_candlestick(df: pd.DataFrame, title: str):
+    if df is None or df.empty:
+        st.info(f"No data to plot for {title}.")
+        return
+    fig = go.Figure(data=[go.Candlestick(
+        x=df["Date"],
+        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name=title
+    )])
+    fig.update_layout(title=title, height=420, xaxis_title="Date", yaxis_title="Price")
+    st.plotly_chart(fig, use_container_width=True)
+
+def normalize_like_for_like(series_map: dict[str, pd.Series]) -> pd.DataFrame:
+    """
+    Normalize multiple price series to a common index (100) on their first overlapping date.
+    Aligns by inner join on the intersection of dates.
+    """
+    frames = []
+    for name, ser in series_map.items():
+        s = ser.dropna().copy()
+        s.name = name
+        frames.append(s)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, axis=1, join="inner").dropna(how="all")
+    if df.empty:
+        return df
+    # rebase each series to 100 on the first row
+    base = df.iloc[0]
+    df = df.divide(base) * 100.0
+    df["Date"] = df.index
+    return df.reset_index(drop=True)
+
+def plot_normalized(df_norm: pd.DataFrame, title: str):
+    if df_norm is None or df_norm.empty:
+        st.info("No overlapping data to compare.")
+        return
+    fig = go.Figure()
+    date_col = "Date"
+    for col in df_norm.columns:
+        if col == date_col:
+            continue
+        fig.add_trace(go.Scatter(x=df_norm[date_col], y=df_norm[col], mode="lines", name=col))
+    fig.update_layout(title=title, height=420, xaxis_title="Date", yaxis_title="Indexed (100 = start)")
+    st.plotly_chart(fig, use_container_width=True)
+
+# -----------------------------
+# AI Summary
+# -----------------------------
+def ai_summarize(summary_df: pd.DataFrame) -> str:
+    if client is None or not OPENAI_API_KEY:
+        return "⚠️ AI summary disabled: no OpenAI API key found (add OPENAI_API_KEY in Streamlit Secrets)."
+
+    table_md = summary_df.to_markdown(index=False)
+
+    prompt = (
+        "You are a professional markets analyst. Analyze today's performance for the assets below.\n\n"
+        f"{table_md}\n\n"
+        "Write a concise 3-paragraph report:\n"
+        "1) Overview of the day's movements and highlights.\n"
+        "2) Compare performance across assets (stocks vs. crypto), note dispersion and notable outliers.\n"
+        "3) Mention any unusual volatility or significant changes; keep it factual and avoid advice.\n"
+        "Tone: analytical, concise (150–220 words). No emojis. No recommendations."
+    )
+
+    try:
+        if using_new_openai:
+            # New SDK
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a professional market analyst."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                max_tokens=350,
+            )
+            return resp.choices[0].message.content.strip()
+        else:
+            # Legacy SDK
+            resp = client.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a professional market analyst."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                max_tokens=350,
+            )
+            return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ AI summary unavailable: {e}"
+
+# -----------------------------
+# Sidebar actions
+# -----------------------------
+if st.sidebar.button("🔄 Refresh data"):
+    st.cache_data.clear()
+
+st.sidebar.info(f"Data auto-refreshes every {REFRESH_INTERVAL_MINUTES} minutes.")
+
+# -----------------------------
+# Fetch Data
+# -----------------------------
+with st.spinner("Fetching latest market data..."):
+    stocks = USER_STOCKS
+    cryptos = USER_CRYPTOS
+    stock_data, crypto_data = fetch_all_data(stocks, cryptos)
+
+# -----------------------------
+# Overview Metrics
+# -----------------------------
+st.header("Market Overview")
+
+# Stocks metrics
+stock_cols = st.columns(len(stocks))
+for i, t in enumerate(stocks):
+    df = stock_data.get(t, pd.DataFrame())
+    if df.empty:
+        stock_cols[i].metric(label=t, value="N/A", delta="N/A")
+        continue
+    last = df["Close"].iloc[-1]
+    prev = df["Close"].iloc[-2] if len(df) > 1 else last
+    delta = (last - prev) / prev * 100.0 if prev else 0.0
+    stock_cols[i].metric(label=t, value=f"${last:,.2f}", delta=f"{delta:.2f}%")
+
+# Crypto metrics
+crypto_cols = st.columns(len(cryptos))
+for i, c in enumerate(cryptos):
+    df = crypto_data.get(c, pd.DataFrame())
+    if df.empty:
+        crypto_cols[i].metric(label=c, value="N/A", delta="N/A")
+        continue
+    last = df["Price"].iloc[-1]
+    prev = df["Price"].iloc[-2] if len(df) > 1 else last
+    delta = (last - prev) / prev * 100.0 if prev else 0.0
+    crypto_cols[i].metric(label=c, value=f"${last:,.4f}", delta=f"{delta:.2f}%")
+
+# -----------------------------
+# Charts
+# -----------------------------
+st.header("Historical Trends")
+
+left, right = st.columns(2)
+
+with left:
+    for t, df in stock_data.items():
+        if df.empty:
+            st.info(f"{t}: no data.")
+            continue
+        # Candlestick for stocks
+        plot_candlestick(df, f"{t} — Daily Candlestick")
+        # Optional simple line on Adj Close
+        plot_line(df, f"{t} — Adj Close (line)", y_col="Adj Close", y_label="Adj Close")
+
+with right:
+    for c, df in crypto_data.items():
+        if df.empty:
+            st.info(f"{c}: no data.")
+            continue
+        plot_line(df, f"{c} — USD Price (line)", y_col="Price", y_label="USD Price")
+
+# -----------------------------
+# Quarterly Comparison (Stocks)
+# -----------------------------
+st.header("Quarter-on-Quarter Comparison (Stocks)")
+for t, df in stock_data.items():
+    qc = quarterly_comparison_stocks(df)
+    st.subheader(t)
+    if qc.empty:
+        st.info("No quarterly data.")
+    else:
+        st.dataframe(qc.tail(8), use_container_width=True)
+
+# -----------------------------
+# Cross-Asset Like-for-Like (Indexed 100)
+# -----------------------------
+st.header("Like-for-Like Comparison (Indexed to 100)")
+
+# Prepare aligned, normalized series
+series_map = {}
+for t, df in stock_data.items():
+    if not df.empty:
+        s = df.set_index("Date")["Close"].astype(float)
+        series_map[t] = s
+for c, df in crypto_data.items():
+    if not df.empty:
+        s = df.set_index("Date")["Price"].astype(float)
+        series_map[c] = s
+
+df_norm = normalize_like_for_like(series_map)
+plot_normalized(df_norm, "Cross-Asset Comparison (Rebased to 100 at First Overlap)")
+
+# -----------------------------
+# Daily Summary + Alerts
+# -----------------------------
+st.header("Daily Summary")
+summary_rows = []
+for t, df in stock_data.items():
+    if not df.empty:
+        daily_return = df["Close"].pct_change().iloc[-1] * 100.0 if len(df) > 1 else 0.0
+        summary_rows.append({"Asset": t, "Type": "Stock", "Daily % Change": daily_return})
+
+for c, df in crypto_data.items():
+    if not df.empty:
+        daily_return = df["Price"].pct_change().iloc[-1] * 100.0 if len(df) > 1 else 0.0
+        summary_rows.append({"Asset": c, "Type": "Crypto", "Daily % Change": daily_return})
+
+summary_df = pd.DataFrame(summary_rows)
+st.dataframe(summary_df, use_container_width=True)
+
+alerts = summary_df[summary_df["Daily % Change"].abs() > 5.0]
+if not alerts.empty:
+    st.warning("Significant movements detected (>5%):")
+    st.table(alerts)
+else:
+    st.success("No major movements today.")
+
+# -----------------------------
+# AI Analysis
+# -----------------------------
+st.header("AI Market Summary")
+st.markdown(ai_summarize(summary_df))
