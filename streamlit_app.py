@@ -85,20 +85,49 @@ def fetch_json(url: str, params: dict | None = None, retries: int = 3, timeout: 
 # -----------------------------
 @st.cache_data(ttl=REFRESH_INTERVAL_MINUTES * 60, show_spinner=False)
 def get_stock_data(ticker: str) -> pd.DataFrame:
-    """Fetch daily OHLCV for a stock via yfinance, limited to YEARS_HISTORY."""
+    """Fetch daily OHLCV for a stock via yfinance, limited to YEARS_HISTORY.
+       Handles unnamed datetime index -> 'index' -> 'Date' renaming robustly.
+    """
     yf_symbol = YF_TICKER_MAP.get(ticker, ticker)
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=YEARS_HISTORY * 365)
 
-    df = yf.download(yf_symbol, start=start_date, end=end_date, interval="1d", progress=False, auto_adjust=False)
+    df = yf.download(
+        yf_symbol,
+        start=start_date,
+        end=end_date,
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+    )
+
     if df is None or df.empty:
         return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"])
 
-    df = df.reset_index().rename(columns={"Date": "Date"})
-    # Ensure correct dtypes
-    if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    # Reset index and make sure the date column is named 'Date'
+    df = df.reset_index()
+    if "Date" not in df.columns:
+        # yfinance sometimes uses 'index' if the DatetimeIndex had no name
+        if "index" in df.columns:
+            df.rename(columns={"index": "Date"}, inplace=True)
+        else:
+            # last resort: take the first datetime-like column
+            first_col = df.columns[0]
+            df.rename(columns={first_col: "Date"}, inplace=True)
+
+    # Ensure datetime dtype
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df.dropna(subset=["Date"], inplace=True)
+
+    # Some providers omit 'Adj Close' for certain tickers/intervals
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"]
+
+    # Ensure required columns exist even if empty
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
     return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]]
 
 @st.cache_data(ttl=REFRESH_INTERVAL_MINUTES * 60, show_spinner=False)
@@ -371,27 +400,41 @@ plot_normalized(df_norm, "Cross-Asset Comparison (Rebased to 100 at First Overla
 # -----------------------------
 # Daily Summary + Alerts
 # -----------------------------
+# -----------------------------
+# Daily Summary + Alerts
+# -----------------------------
 st.header("Daily Summary")
 summary_rows = []
+
 for t, df in stock_data.items():
-    if not df.empty:
-        daily_return = df["Close"].pct_change().iloc[-1] * 100.0 if len(df) > 1 else 0.0
-        summary_rows.append({"Asset": t, "Type": "Stock", "Daily % Change": daily_return})
+    if not df.empty and "Close" in df.columns:
+        daily_return = (df["Close"].pct_change().iloc[-1] * 100.0) if len(df) > 1 else 0.0
+        summary_rows.append({"Asset": t, "Type": "Stock", "Daily % Change": float(daily_return)})
 
 for c, df in crypto_data.items():
-    if not df.empty:
-        daily_return = df["Price"].pct_change().iloc[-1] * 100.0 if len(df) > 1 else 0.0
-        summary_rows.append({"Asset": c, "Type": "Crypto", "Daily % Change": daily_return})
+    if not df.empty and "Price" in df.columns:
+        daily_return = (df["Price"].pct_change().iloc[-1] * 100.0) if len(df) > 1 else 0.0
+        summary_rows.append({"Asset": c, "Type": "Crypto", "Daily % Change": float(daily_return)})
 
-summary_df = pd.DataFrame(summary_rows)
-st.dataframe(summary_df, use_container_width=True)
+summary_df = pd.DataFrame(summary_rows, columns=["Asset", "Type", "Daily % Change"])
 
-alerts = summary_df[summary_df["Daily % Change"].abs() > 5.0]
-if not alerts.empty:
-    st.warning("Significant movements detected (>5%):")
-    st.table(alerts)
+if summary_df.empty:
+    st.info("No data available yet for a daily summary.")
 else:
-    st.success("No major movements today.")
+    st.dataframe(summary_df, use_container_width=True)
+
+    # Alerts only if the column exists and DataFrame not empty
+    if "Daily % Change" in summary_df.columns and not summary_df.empty:
+        alerts = summary_df.loc[summary_df["Daily % Change"].abs() > 5.0].copy()
+    else:
+        alerts = pd.DataFrame(columns=summary_df.columns)
+
+    if not alerts.empty:
+        st.warning("Significant movements detected (>5%):")
+        st.table(alerts)
+    else:
+        st.success("No major movements today.")
+
 
 # -----------------------------
 # AI Analysis
